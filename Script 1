@@ -1,0 +1,177 @@
+// === CONFIGURATION ===
+const SPREADSHEET_ID = "1BXz46rvcFocg3F4ArDtq68MTqeslu-pX5icL7Mcg7ms";
+const SHEET_NAME     = "Form Responses 1";  // <-- update if your tab is named differently
+
+const APPROVAL_ROUTING = {
+  "Operations (CS, Medical Evidence, Nexus Advisors)": {
+    first:  "joel@claimclimbers.com",
+    second: "matt@claimclimbers.com"
+  },
+  "Marketing": {
+    first:  "james@claimclimbers.com",
+    second: "matt@claimclimbers.com"
+  },
+  "Tech": {
+    first:  "josh@claimclimbers.com",
+    second: "matt@claimclimbers.com"
+  },
+  "Executive": {
+    first:  "sam@claimclimbers.com",
+    second: "matt@claimclimbers.com"
+  },
+  "Admin / Finance / HR": {
+    first:  "matt@claimclimbers.com",
+    second: "james@claimclimbers.com"
+  },
+  "Other": {
+    first:  "matt@claimclimbers.com",
+    second: "mattashleymt@gmail.com"
+  }
+};
+
+// Dynamically get this script's published URL
+const SCRIPT_URL = ScriptApp.getService().getUrl();
+
+function onFormSubmit(e) {
+  // open the right spreadsheet & sheet by ID/name
+  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const row   = e.range.getRow();
+  const lastCol = sheet.getLastColumn();
+  
+  // build a data object from headers → values
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const values  = sheet.getRange(row, 1, 1, lastCol).getValues()[0];
+  const data    = Object.fromEntries(headers.map((h, i) => [h, values[i]]));
+
+  const dept           = (data["Department"] || "").trim();
+  const routing        = APPROVAL_ROUTING[dept] || APPROVAL_ROUTING["Other"];
+  const firstApprover  = routing.first;
+  const requestorName  = data["Requestor Name"] || "Someone";
+  
+  // build action URLs
+  const approveUrl = `${SCRIPT_URL}?row=${row}&decision=Approved&stage=1&approver=${encodeURIComponent(firstApprover)}`;
+  const denyUrl    = `${SCRIPT_URL}?row=${row}&decision=Denied&stage=1&approver=${encodeURIComponent(firstApprover)}`;
+  
+  // fire off the first-approval email
+  const emailBody = generateStyledEmail(data, approveUrl, denyUrl, "📋 Requisition Request", requestorName);
+  MailApp.sendEmail({
+    to:       firstApprover,
+    subject:  `Approval Needed: ${data["Requisition Title"]}`,
+    htmlBody: emailBody
+  });
+}
+
+function doGet(e) {
+  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  const params = e.parameter;
+  const row     = parseInt(params.row, 10);
+  const decision = params.decision;
+  const stage    = parseInt(params.stage, 10);
+  const approver = params.approver;
+  const timestamp = new Date();
+
+  // re-fetch the row’s data for context
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const values  = sheet.getRange(row, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const data    = Object.fromEntries(headers.map((h, i) => [h, values[i]]));
+  const dept           = (data["Department"] || "").trim();
+  const requestorEmail  = data["Email Address"] || "";
+  const requestorName   = data["Requestor Name"]  || "The submitter";
+
+  // === FIRST APPROVAL HANDLING ===
+  if (stage === 1) {
+    sheet.getRange(row, getColumnIndex("1st Approval Status")).setValue(decision);
+    sheet.getRange(row, getColumnIndex("1st Approval Timestamp")).setValue(timestamp);
+    sheet.getRange(row, getColumnIndex("1st Approver Name")).setValue(approver);
+
+    if (decision === "Approved") {
+      const secondApprover = (APPROVAL_ROUTING[dept] || APPROVAL_ROUTING["Other"]).second;
+      const approveUrl2 = `${SCRIPT_URL}?row=${row}&decision=Approved&stage=2&approver=${encodeURIComponent(secondApprover)}`;
+      const denyUrl2    = `${SCRIPT_URL}?row=${row}&decision=Denied&stage=2&approver=${encodeURIComponent(secondApprover)}`;
+      const emailBody2  = generateStyledEmail(data, approveUrl2, denyUrl2, "📋 Second-Level Requisition Approval", requestorName);
+
+      MailApp.sendEmail({
+        to:       secondApprover,
+        subject:  `2nd Approval Needed: ${data["Requisition Title"]}`,
+        htmlBody: emailBody2
+      });
+    }
+  }
+
+  // === SECOND APPROVAL HANDLING ===
+  if (stage === 2) {
+    sheet.getRange(row, getColumnIndex("2nd Approval Status")).setValue(decision);
+    sheet.getRange(row, getColumnIndex("2nd Approval Timestamp")).setValue(timestamp);
+    sheet.getRange(row, getColumnIndex("2nd Approver Name")).setValue(approver);
+
+    // notify the requester on final decision
+    if (requestorEmail) {
+      const finalHtml = `
+        <div style="font-family: Arial, sans-serif; line-height:1.6;">
+          <h2 style="color:#2e6c80;">${ decision === "Approved" ? "✅ Your Requisition Was Approved" : "❌ Your Requisition Was Denied" }</h2>
+          <p>Your requisition titled <strong>${data["Requisition Title"]}</strong> has been ${decision.toLowerCase()} by both reviewers.</p>
+          <p>We will be in touch soon with next steps.</p>
+          <hr/>
+          <p style="font-size:0.9em; color:#888;">This message was generated automatically by Claim Climbers’ approval system.</p>
+        </div>`;
+      MailApp.sendEmail({
+        to:       requestorEmail,
+        subject:  `${ decision === "Approved" ? "✅ Approved" : "❌ Denied" }: ${data["Requisition Title"]}`,
+        htmlBody: finalHtml
+      });
+    }
+  }
+
+  // === SHOW CONFIRMATION PAGE ===
+  return HtmlService.createHtmlOutput(`
+    <div style="font-family:Arial,sans-serif;text-align:center;padding:40px;">
+      <h2 style="color:#2e6c80;">✅ Response Recorded</h2>
+      <p>Your ${stage === 1 ? "first" : "second"}-stage decision of <strong>${decision}</strong> has been logged.</p>
+      <p>You may now close this window.</p>
+    </div>
+  `);
+}
+
+function getColumnIndex(columnName) {
+  const sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const idx = headers.indexOf(columnName);
+  if (idx === -1) throw new Error(`Header "${columnName}" not found`);
+  return idx + 1;
+}
+
+function generateStyledEmail(data, approveUrl, denyUrl, title, requestorName) {
+  let html = `
+    <div style="font-family: Arial, sans-serif; line-height:1.6;">
+      <p><strong>${requestorName}</strong> submitted a requisition that requires your review.</p>
+      <h2 style="color:#2e6c80;">${title}</h2>
+      <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;">`;
+  
+  for (const [key, value] of Object.entries(data)) {
+    if (!key.toLowerCase().includes("approval") && value) {
+      html += `
+        <tr>
+          <td style="font-weight:bold;padding:4px 8px;vertical-align:top;">${key}:</td>
+          <td style="padding:4px 8px;">${value}</td>
+        </tr>`;
+    }
+  }
+  
+  html += `
+      </table>
+      <br/>
+      <div>
+        <strong>Take Action:</strong><br/><br/>
+        <a href="${approveUrl}" style="padding:10px 20px;background-color:#4CAF50;color:white;text-decoration:none;border-radius:4px;margin-right:10px;">
+          ✅ Approve
+        </a>
+        <a href="${denyUrl}" style="padding:10px 20px;background-color:#f44336;color:white;text-decoration:none;border-radius:4px;">
+          ❌ Deny
+        </a>
+      </div>
+    </div>`;
+  
+  return html;
+}
